@@ -48,7 +48,7 @@ class MetrikaClient:
         date1: str | None = None,
         date2: str | None = None,
         filters: str | None = None,
-        accuracy: str = "high",
+        accuracy: str = "full",
         limit: int = 100000,
         sort: str | None = None,
         offset: int | None = None,
