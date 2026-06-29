@@ -48,8 +48,9 @@ class MetrikaClient:
         date1: str | None = None,
         date2: str | None = None,
         filters: str | None = None,
-        sort: str | None = None,
+        accuracy: str = "high",
         limit: int = 100000,
+        sort: str | None = None,
         offset: int | None = None,
     ) -> pd.DataFrame:
         """Fetch a report and return a normalized DataFrame."""
@@ -64,7 +65,7 @@ class MetrikaClient:
             "date2": date2 or "today",
             "metrics": metrics_str,
             "filters": combined_filters,
-            "accuracy": "full",
+            "accuracy": accuracy,
             "limit": limit,
         }
         if dimensions_str:

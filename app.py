@@ -99,13 +99,85 @@ def prepare_report(df: pd.DataFrame, reg_goal_id: str | None) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def cached_fetch(token: str, counter_id: str, metrics: tuple[str, ...], dimensions: tuple[str, ...], date1: str, date2: str, refresh_key: int) -> pd.DataFrame:
+def cached_fetch(
+    token: str,
+    counter_id: str,
+    metrics: tuple[str, ...],
+    dimensions: tuple[str, ...],
+    date1: str,
+    date2: str,
+    refresh_key: int,
+    accuracy: str,
+    limit: int,
+    sort: str | None,
+) -> pd.DataFrame:
     client = MetrikaClient(token=token, counter_id=counter_id)
-    return client.fetch_report(metrics=list(metrics), dimensions=list(dimensions) or None, date1=date1, date2=date2)
+    return client.fetch_report(
+        metrics=list(metrics),
+        dimensions=list(dimensions) or None,
+        date1=date1,
+        date2=date2,
+        accuracy=accuracy,
+        limit=limit,
+        sort=sort,
+    )
 
 
-def load_report(token: str, counter_id: str, metrics: list[str], dimensions: list[str], date1: str, date2: str, refresh_key: int) -> pd.DataFrame:
-    return cached_fetch(token, counter_id, tuple(metrics), tuple(dimensions), date1, date2, refresh_key)
+def load_report(
+    token: str,
+    counter_id: str,
+    metrics: list[str],
+    dimensions: list[str],
+    date1: str,
+    date2: str,
+    refresh_key: int,
+    accuracy: str = "high",
+    limit: int = 100000,
+    sort: str | None = None,
+) -> pd.DataFrame:
+    return cached_fetch(token, counter_id, tuple(metrics), tuple(dimensions), date1, date2, refresh_key, accuracy, limit, sort)
+
+
+def is_too_complicated(exc: MetrikaAPIError) -> bool:
+    return "query is too complicated" in str(exc).lower()
+
+
+def lighter_accuracies(accuracy: str) -> list[str]:
+    order = ["full", "high", "medium", "low"]
+    normalized = (accuracy or "high").lower()
+    if normalized not in order:
+        normalized = "high"
+    return order[order.index(normalized) :]
+
+
+def safe_load_report(
+    title: str,
+    token: str,
+    counter_id: str,
+    metrics: list[str],
+    dimensions: list[str],
+    date1: str,
+    date2: str,
+    refresh_key: int,
+    accuracy: str = "high",
+    limit: int = 1000,
+    sort: str | None = None,
+) -> pd.DataFrame:
+    last_error: MetrikaAPIError | None = None
+    for attempt_accuracy in lighter_accuracies(accuracy):
+        try:
+            return load_report(token, counter_id, metrics, dimensions, date1, date2, refresh_key, attempt_accuracy, limit, sort)
+        except MetrikaAPIError as exc:
+            last_error = exc
+            if not is_too_complicated(exc):
+                break
+    if last_error:
+        st.warning(
+            f"{title}: Метрика не смогла построить этот отчет на выбранном периоде с текущей точностью. "
+            "Попробуйте уменьшить период или выбрать более быстрый режим точности. "
+            f"Текст ошибки: {last_error}"
+        )
+    return pd.DataFrame()
 
 
 def date_range_from_sidebar() -> tuple[str, str]:
@@ -158,10 +230,12 @@ def main() -> None:
     default_counter = read_setting("YANDEX_METRIKA_COUNTER_ID")
     default_reg_goal = read_setting("YANDEX_METRIKA_REG_GOAL_ID")
     date1, date2 = date_range_from_sidebar()
-    counter_id = st.sidebar.text_input("Counter ID", value=default_counter)
-    reg_goal_id = st.sidebar.text_input("Goal ID успешной регистрации", value=default_reg_goal)
+    accuracy_label = st.sidebar.selectbox("Точность данных", ["Быстрее", "Точнее", "Максимально точно"], index=1)
+    report_accuracy = {"Быстрее": "medium", "Точнее": "high", "Максимально точно": "full"}[accuracy_label]
+    counter_id = st.sidebar.text_input("Counter ID", value=default_counter).strip()
+    reg_goal_id = st.sidebar.text_input("Goal ID успешной регистрации", value=default_reg_goal).strip()
     st.session_state.reg_goal_id = reg_goal_id
-    optional_goal_ids = {key: st.sidebar.text_input(label, value=read_setting(env)) for key, (label, env) in OPTIONAL_GOALS.items()}
+    optional_goal_ids = {key: st.sidebar.text_input(label, value=read_setting(env)).strip() for key, (label, env) in OPTIONAL_GOALS.items()}
     if st.sidebar.button("Обновить данные"):
         st.session_state.refresh_key += 1
         st.cache_data.clear()
@@ -181,7 +255,7 @@ def main() -> None:
 
     metrics = make_metrics(reg_goal_id)
     try:
-        total_raw = load_report(token, counter_id, metrics, [], date1, date2, st.session_state.refresh_key)
+        total_raw = load_report(token, counter_id, metrics, [], date1, date2, st.session_state.refresh_key, accuracy="full")
     except (MetrikaConfigError, MetrikaAPIError) as exc:
         st.error(str(exc))
         return
@@ -206,24 +280,45 @@ def main() -> None:
     tab_dyn, tab_dev, tab_src, tab_funnel, tab_problems = st.tabs(["Динамика", "Устройства", "Источники", "Промежуточные цели", "Проблемные сегменты"])
 
     with tab_dyn:
-        df = prepare_report(load_report(token, counter_id, metrics, ["ym:s:date"], date1, date2, st.session_state.refresh_key), reg_goal_id).rename(columns={"ym:s:date": "date"})
+        df = prepare_report(
+            safe_load_report("Динамика", token, counter_id, metrics, ["ym:s:date"], date1, date2, st.session_state.refresh_key, report_accuracy, limit=10000),
+            reg_goal_id,
+        ).rename(columns={"ym:s:date": "date"})
         if not show_empty_if_needed(df):
             st.dataframe(df[["date", "visits", "users", "registrations", "CR", "bounceRate"]].style.format({"CR": "{:.1f}%", "bounceRate": "{:.1f}%"}), use_container_width=True)
             st.plotly_chart(px.line(df, x="date", y=["visits", "registrations"], markers=True), use_container_width=True)
 
     with tab_dev:
         for title, dim in [("Категория устройства", "ym:s:deviceCategory"), ("Браузер", "ym:s:browser"), ("Операционная система", "ym:s:operatingSystem")]:
-            dimension_table(title, load_report(token, counter_id, metrics, [dim], date1, date2, st.session_state.refresh_key), dim, avg_cr, avg_bounce)
+            dimension_table(
+                title,
+                safe_load_report(title, token, counter_id, metrics, [dim], date1, date2, st.session_state.refresh_key, report_accuracy, limit=1000, sort=f"-{VISITS}"),
+                dim,
+                avg_cr,
+                avg_bounce,
+            )
 
     with tab_src:
-        dims = ["ym:s:lastTrafficSource", "ym:s:UTMSource", "ym:s:UTMMedium", "ym:s:UTMCampaign", "ym:s:UTMContent"]
-        df = prepare_report(load_report(token, counter_id, metrics, dims, date1, date2, st.session_state.refresh_key), reg_goal_id)
-        if not show_empty_if_needed(df):
-            df = df.rename(columns={dims[0]: "source", dims[1]: "utm_source", dims[2]: "utm_medium", dims[3]: "utm_campaign", dims[4]: "utm_content"})
+        source_reports = [
+            ("Источник трафика", "ym:s:lastTrafficSource", 1000),
+            ("UTM Source", "ym:s:UTMSource", 1000),
+            ("UTM Medium", "ym:s:UTMMedium", 1000),
+            ("UTM Campaign", "ym:s:UTMCampaign", 1000),
+            ("UTM Content", "ym:s:UTMContent", 500),
+        ]
+        st.caption("lost_registrations — потенциальные потери относительно среднего CR страницы.")
+        for title, dim, limit in source_reports:
+            raw_df = safe_load_report(title, token, counter_id, metrics, [dim], date1, date2, st.session_state.refresh_key, report_accuracy, limit=limit, sort=f"-{VISITS}")
+            if raw_df.empty:
+                continue
+            df = prepare_report(raw_df, reg_goal_id).rename(columns={dim: "segment"})
             df = add_losses(df, avg_cr / 100)
-            cols = ["source", "utm_source", "utm_medium", "utm_campaign", "utm_content", "visits", "registrations", "CR", "bounceRate", "lost_registrations"]
-            st.caption("lost_registrations — потенциальные потери относительно среднего CR страницы.")
-            st.dataframe(df[cols].sort_values(["lost_registrations", "visits"], ascending=False).style.format({"CR": "{:.1f}%", "bounceRate": "{:.1f}%", "lost_registrations": "{:.1f}"}), use_container_width=True)
+            cols = ["segment", "visits", "registrations", "CR", "bounceRate", "lost_registrations"]
+            st.subheader(title)
+            st.dataframe(
+                df[cols].sort_values(["lost_registrations", "visits"], ascending=False).style.format({"CR": "{:.1f}%", "bounceRate": "{:.1f}%", "lost_registrations": "{:.1f}"}),
+                use_container_width=True,
+            )
 
     with tab_funnel:
         goal_steps = [("Визиты на create", None)]
@@ -235,7 +330,7 @@ def main() -> None:
         funnel_rows = []
         previous = None
         for label, gid in goal_steps:
-            reaches = visits if gid is None else safe_number(prepare_report(load_report(token, counter_id, [goal_reaches_metric(gid)], [], date1, date2, st.session_state.refresh_key), gid), "registrations")
+            reaches = visits if gid is None else safe_number(prepare_report(load_report(token, counter_id, [goal_reaches_metric(gid)], [], date1, date2, st.session_state.refresh_key, accuracy="full"), gid), "registrations")
             funnel_rows.append({"step": label, "reaches": reaches, "conversion_from_visits": reaches / visits * 100 if visits else 0, "drop_off_from_previous": (previous - reaches) / previous * 100 if previous else 0})
             previous = reaches
         st.dataframe(pd.DataFrame(funnel_rows).style.format({"reaches": "{:.0f}", "conversion_from_visits": "{:.1f}%", "drop_off_from_previous": "{:.1f}%"}), use_container_width=True)
@@ -244,7 +339,10 @@ def main() -> None:
         segments = [("deviceCategory", "ym:s:deviceCategory"), ("browser", "ym:s:browser"), ("operatingSystem", "ym:s:operatingSystem"), ("UTM Campaign", "ym:s:UTMCampaign"), ("traffic source", "ym:s:lastTrafficSource")]
         frames = []
         for label, dim in segments:
-            sdf = prepare_report(load_report(token, counter_id, metrics, [dim], date1, date2, st.session_state.refresh_key), reg_goal_id).rename(columns={dim: "segment"})
+            raw_sdf = safe_load_report(label, token, counter_id, metrics, [dim], date1, date2, st.session_state.refresh_key, report_accuracy, limit=1000, sort=f"-{VISITS}")
+            if raw_sdf.empty:
+                continue
+            sdf = prepare_report(raw_sdf, reg_goal_id).rename(columns={dim: "segment"})
             if not sdf.empty:
                 sdf["segment_type"] = label
                 frames.append(sdf)
